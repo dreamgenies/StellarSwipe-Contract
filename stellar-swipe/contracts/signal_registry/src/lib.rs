@@ -14,6 +14,8 @@ mod import;
 mod leaderboard;
 mod performance;
 mod query;
+mod reputation;
+mod test_reputation;
 mod social;
 mod stake;
 mod submission;
@@ -46,7 +48,22 @@ use types::{
     SignalAction, SignalData, SignalPerformanceView, SignalStatus, SignalSummary, SortOption,
     TradeExecution,
 };
+ trust-score-system
+use combos::{
+    cancel_combo, create_combo_signal, execute_combo_signal, get_combo,
+    get_combo_executions_pub, get_combo_performance, ComboExecution,
+    ComboPerformanceSummary, ComboSignal, ComboType, ComponentExecution,
+    ComponentSignal,
+};
+use errors::ComboError;
+use contests::{
+    Contest, ContestEntry, ContestMetric, ContestStatus,
+};
+use versioning::{SignalVersion, CopyRecord};
+use reputation::{calculate_trust_score, get_trust_score, update_trust_score, update_median_values, TrustScoreDetails, TrustScoreTier};
+
 use versioning::{CopyRecord, SignalVersion};
+ main
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -364,8 +381,11 @@ impl SignalRegistry {
         // Initialize provider stats on first submission
         let mut stats = Self::get_provider_stats_map(env);
         if !stats.contains_key(provider.clone()) {
-            stats.set(provider, ProviderPerformance::default());
+            stats.set(provider.clone(), ProviderPerformance::default());
             Self::save_provider_stats_map(env, &stats);
+
+            // Record first signal time for trust score calculation
+            reputation::record_first_signal(env, &provider);
         }
 
         Ok(id)
@@ -573,6 +593,9 @@ impl SignalRegistry {
             provider_stats_map.set(signal.provider.clone(), provider_stats.clone());
             Self::save_provider_stats_map(&env, &provider_stats_map);
 
+            // Update trust score when performance changes
+            Self::update_provider_trust_score(env.clone(), signal.provider.clone());
+
             // Emit status change event
             events::emit_signal_status_changed(
                 &env,
@@ -745,12 +768,22 @@ impl SignalRegistry {
 
     /// Follow a provider. Idempotent if already following.
     pub fn follow_provider(env: Env, user: Address, provider: Address) -> Result<(), AdminError> {
-        social::follow_provider(&env, user, provider).map_err(|_| AdminError::CannotFollowSelf)
+        social::follow_provider(&env, user, provider).map_err(|_| AdminError::CannotFollowSelf)?;
+
+        // Update trust score when follower count changes
+        Self::update_provider_trust_score(env, provider);
+
+        Ok(())
     }
 
     /// Unfollow a provider. No error if not following.
     pub fn unfollow_provider(env: Env, user: Address, provider: Address) -> Result<(), AdminError> {
-        social::unfollow_provider(&env, user, provider).map_err(|_| AdminError::Unauthorized)
+        social::unfollow_provider(&env, user, provider).map_err(|_| AdminError::Unauthorized)?;
+
+        // Update trust score when follower count changes
+        Self::update_provider_trust_score(env, provider);
+
+        Ok(())
     }
 
     /// Get list of providers user follows
@@ -1297,6 +1330,130 @@ impl SignalRegistry {
     /// Mark user as notified of an update
     pub fn mark_update_notified(env: Env, user: Address, signal_id: u64, version: u32) {
         versioning::mark_notified(&env, &user, signal_id, version);
+    }
+
+    /* =========================
+       TRUST SCORE FUNCTIONS
+    ========================== */
+
+    /// Get trust score for a provider
+    ///
+    /// Returns None if provider has insufficient history (< 5 signals)
+    /// Trust score ranges from 0-100 with tier classifications
+    pub fn get_provider_trust_score(env: Env, provider: Address) -> Option<TrustScoreDetails> {
+        let performance = Self::get_provider_stats(env.clone(), provider.clone())?;
+        let stake_info = stake::get_stake_info(&env, &provider);
+
+        Some(calculate_trust_score(&env, &provider, &performance, &stake_info))
+    }
+
+    /// Update trust score for a provider (called after performance changes)
+    ///
+    /// This should be called when:
+    /// - Signal status changes (success/failure)
+    /// - Follower count changes
+    /// - Stake amount changes
+    pub fn update_provider_trust_score(env: Env, provider: Address) -> Option<TrustScoreDetails> {
+        let performance = Self::get_provider_stats(env.clone(), provider.clone())?;
+        let stake_info = stake::get_stake_info(&env, &provider);
+
+        let score_details = calculate_trust_score(&env, &provider, &performance, &stake_info);
+        reputation::store_trust_score(&env, &provider, &score_details);
+
+        Some(score_details)
+    }
+
+    /// Get leaderboard sorted by trust score
+    ///
+    /// Returns providers with trust scores, sorted by score descending
+    /// Only includes providers with sufficient history (>= 5 signals)
+    pub fn get_trust_score_leaderboard(env: Env, limit: u32) -> Vec<(Address, TrustScoreDetails)> {
+        // This is a simplified implementation
+        // In production, you'd want to cache this or use a more efficient data structure
+        let stats_map = Self::get_provider_stats_map(&env);
+        let mut providers_with_scores = Vec::new(&env);
+
+        // Collect providers with sufficient history
+        for key in stats_map.keys() {
+            if let Some(performance) = stats_map.get(key.clone()) {
+                if performance.total_signals >= 5 { // MIN_SIGNALS_FOR_TRUST_SCORE
+                    let stake_info = stake::get_stake_info(&env, &key);
+                    let score_details = calculate_trust_score(&env, &key, &performance, &stake_info);
+                    providers_with_scores.push_back((key, score_details));
+                }
+            }
+        }
+
+        // Sort by trust score descending (simple bubble sort)
+        let len = providers_with_scores.len();
+        for i in 0..len {
+            for j in 0..(len - i - 1) {
+                let curr = providers_with_scores.get(j).unwrap();
+                let next = providers_with_scores.get(j + 1).unwrap();
+
+                if curr.1.score < next.1.score {
+                    // Swap
+                    let temp = curr.clone();
+                    providers_with_scores.set(j, next);
+                    providers_with_scores.set(j + 1, temp);
+                }
+            }
+        }
+
+        // Return top N
+        let result_len = if limit > 0 && limit < len { limit } else { len };
+        let mut result = Vec::new(&env);
+        for i in 0..result_len {
+            result.push_back(providers_with_scores.get(i).unwrap());
+        }
+
+        result
+    }
+
+    /// Update global median values for trust score normalization
+    ///
+    /// Should be called periodically by admin to recalculate medians
+    /// This affects stake and follower normalization across all providers
+    pub fn update_trust_score_medians(
+        env: Env,
+        caller: Address,
+        median_stake: i128,
+        median_followers: u64,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+
+        update_median_values(&env, median_stake, median_followers);
+        Ok(())
+    }
+
+    /// Get trust score tier distribution
+    ///
+    /// Returns count of providers in each trust score tier
+    pub fn get_trust_score_distribution(env: Env) -> (u32, u32, u32, u32) {
+        let stats_map = Self::get_provider_stats_map(&env);
+        let mut highly_trusted = 0u32;
+        let mut trusted = 0u32;
+        let mut emerging = 0u32;
+        let mut new_unproven = 0u32;
+
+        for key in stats_map.keys() {
+            if let Some(performance) = stats_map.get(key.clone()) {
+                if performance.total_signals >= 5 {
+                    let stake_info = stake::get_stake_info(&env, &key);
+                    let score_details = calculate_trust_score(&env, &key, &performance, &stake_info);
+
+                    match score_details.tier {
+                        TrustScoreTier::HighlyTrusted => highly_trusted += 1,
+                        TrustScoreTier::Trusted => trusted += 1,
+                        TrustScoreTier::Emerging => emerging += 1,
+                        TrustScoreTier::NewUnproven => new_unproven += 1,
+                    }
+                }
+            }
+        }
+
+        (highly_trusted, trusted, emerging, new_unproven)
     }
 }
 
