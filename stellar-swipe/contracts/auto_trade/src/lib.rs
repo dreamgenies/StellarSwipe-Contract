@@ -7,6 +7,7 @@ mod errors;
 mod history;
 mod multi_asset;
 mod portfolio;
+mod referral;
 mod risk;
 mod sdex;
 mod storage;
@@ -176,6 +177,13 @@ impl AutoTradeContract {
             .set(&DataKey::Trades(user.clone(), signal_id), &trade);
 
         if execution.executed_amount > 0 {
+            // ── Referral fee split ────────────────────────────────────────────
+            // Platform fee = 7% of executed amount (0.7 XLM per 10 XLM trade).
+            // Referral reward = 10% of platform fee → deducted from platform share.
+            let platform_fee = execution.executed_amount * 7 / 100;
+            let referral_reward =
+                referral::process_referral_reward(&env, &user, signal.base_asset, platform_fee);
+
             let hist_status = match status {
                 TradeStatus::Filled | TradeStatus::PartiallyFilled => {
                     history::HistoryTradeStatus::Executed
@@ -190,7 +198,7 @@ impl AutoTradeContract {
                 signal.base_asset,
                 execution.executed_amount,
                 execution.executed_price,
-                0,
+                platform_fee - referral_reward,
                 hist_status,
             );
         }
@@ -287,6 +295,31 @@ impl AutoTradeContract {
     /// Get authorization config
     pub fn get_auth_config(env: Env, user: Address) -> Option<auth::AuthConfig> {
         auth::get_auth_config(&env, &user)
+    }
+
+    // ── Referral public API ───────────────────────────────────────────────────
+
+    /// Register a referrer for the calling user. Must be called before first trade.
+    pub fn set_referrer(
+        env: Env,
+        referee: Address,
+        referrer: Address,
+    ) -> Result<(), AutoTradeError> {
+        referee.require_auth();
+        referral::set_referrer(&env, &referee, &referrer)
+    }
+
+    /// Query referral stats for a referrer (dashboard data).
+    pub fn get_referral_stats(env: Env, referrer: Address) -> referral::ReferralStats {
+        referral::get_referral_stats(&env, &referrer)
+    }
+
+    /// Query the referral entry for a referee (None if not referred / expired).
+    pub fn get_referral_entry(
+        env: Env,
+        referee: Address,
+    ) -> Option<referral::ReferralEntry> {
+        referral::get_referral_entry(&env, &referee)
     }
 }
 

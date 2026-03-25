@@ -767,3 +767,363 @@ fn test_authorization_at_exact_limit() {
         assert!(res.is_ok());
     });
 }
+
+// ========================================
+// Referral & Reward System Tests
+// ========================================
+
+#[cfg(test)]
+mod referral_tests {
+    use super::*;
+    use crate::referral::{self, REFERRAL_WINDOW_SECS, MAX_REFERRAL_TRADES, MAX_ACTIVE_REFERRALS};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
+
+    fn setup_env() -> Env {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+        env
+    }
+
+    fn setup_signal_and_user(env: &Env, contract_id: &Address) -> (Address, u64) {
+        let user = Address::generate(env);
+        let signal_id = 42u64;
+        env.as_contract(contract_id, || {
+            storage::set_signal(
+                env,
+                signal_id,
+                &storage::Signal {
+                    signal_id,
+                    price: 100,
+                    expiry: env.ledger().timestamp() + 1_000_000,
+                    base_asset: 1,
+                },
+            );
+            storage::authorize_user(env, &user);
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("liquidity"), signal_id), &1_000_000_000i128);
+        });
+        (user, signal_id)
+    }
+
+    // ── set_referrer via contract ─────────────────────────────────────────────
+
+    #[test]
+    fn test_contract_set_referrer_success() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let referee = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+
+            let entry =
+                AutoTradeContract::get_referral_entry(env.clone(), referee.clone()).unwrap();
+            assert_eq!(entry.referrer, referrer);
+            assert_eq!(entry.trade_count, 0);
+        });
+    }
+
+    #[test]
+    fn test_contract_self_referral_blocked() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let user = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            let err =
+                AutoTradeContract::set_referrer(env.clone(), user.clone(), user.clone())
+                    .unwrap_err();
+            assert_eq!(err, AutoTradeError::SelfReferral);
+        });
+    }
+
+    #[test]
+    fn test_contract_referral_already_set_blocked() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let referee = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+            let err =
+                AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                    .unwrap_err();
+            assert_eq!(err, AutoTradeError::ReferralAlreadySet);
+        });
+    }
+
+    #[test]
+    fn test_contract_circular_referral_blocked() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            // A → B → C, then C tries to refer A (circular)
+            AutoTradeContract::set_referrer(env.clone(), b.clone(), a.clone()).unwrap();
+            AutoTradeContract::set_referrer(env.clone(), c.clone(), b.clone()).unwrap();
+            let err =
+                AutoTradeContract::set_referrer(env.clone(), a.clone(), c.clone()).unwrap_err();
+            assert_eq!(err, AutoTradeError::CircularReferral);
+        });
+    }
+
+    #[test]
+    fn test_contract_max_referral_limit_101st_blocked() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            // Manually set active_referrals to MAX
+            use crate::referral::{ReferralStats, ReferralKey};
+            use soroban_sdk::Map;
+            let stats = ReferralStats {
+                total_referrals: MAX_ACTIVE_REFERRALS,
+                active_referrals: MAX_ACTIVE_REFERRALS,
+                total_earnings: 0,
+                earnings_by_asset: Map::new(&env),
+            };
+            env.storage()
+                .persistent()
+                .set(&ReferralKey::Stats(referrer.clone()), &stats);
+
+            let new_referee = Address::generate(&env);
+            let err =
+                AutoTradeContract::set_referrer(env.clone(), new_referee, referrer.clone())
+                    .unwrap_err();
+            assert_eq!(err, AutoTradeError::ReferralLimitExceeded);
+        });
+    }
+
+    // ── Reward earned on trade execution ─────────────────────────────────────
+
+    #[test]
+    fn test_referrer_earns_10_percent_of_platform_fee_on_trade() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let (referee, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                referee.clone(),
+                signal_id,
+                OrderType::Market,
+                10_000_000,
+            )
+            .unwrap();
+
+            let stats =
+                AutoTradeContract::get_referral_stats(env.clone(), referrer.clone());
+            // platform_fee = 10_000_000 * 7 / 100 = 700_000
+            // referral_reward = 700_000 * 10 / 100 = 70_000
+            assert_eq!(stats.total_earnings, 70_000);
+        });
+    }
+
+    #[test]
+    fn test_referrer_earns_across_10_trades() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let (referee, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+        });
+
+        for _ in 0..10 {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    referee.clone(),
+                    signal_id,
+                    OrderType::Market,
+                    10_000_000,
+                )
+                .unwrap();
+            });
+        }
+
+        env.as_contract(&contract_id, || {
+            let stats = AutoTradeContract::get_referral_stats(env.clone(), referrer.clone());
+            assert_eq!(stats.total_earnings, 10 * 70_000);
+        });
+    }
+
+    #[test]
+    fn test_reward_stops_after_90_days_simulation() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let (referee, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+
+            // Earn some rewards first
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                referee.clone(),
+                signal_id,
+                OrderType::Market,
+                10_000_000,
+            )
+            .unwrap();
+
+            let earnings_before =
+                AutoTradeContract::get_referral_stats(env.clone(), referrer.clone())
+                    .total_earnings;
+            assert!(earnings_before > 0);
+
+            // Advance past 90 days
+            env.ledger()
+                .set_timestamp(1_000_000 + REFERRAL_WINDOW_SECS + 1);
+
+            // Update signal expiry so trade itself doesn't fail
+            storage::set_signal(
+                &env,
+                signal_id,
+                &storage::Signal {
+                    signal_id,
+                    price: 100,
+                    expiry: env.ledger().timestamp() + 1_000_000,
+                    base_asset: 1,
+                },
+            );
+
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                referee.clone(),
+                signal_id,
+                OrderType::Market,
+                10_000_000,
+            )
+            .unwrap();
+
+            // Earnings must not have increased
+            let earnings_after =
+                AutoTradeContract::get_referral_stats(env.clone(), referrer.clone())
+                    .total_earnings;
+            assert_eq!(earnings_before, earnings_after);
+        });
+    }
+
+    #[test]
+    fn test_reward_stops_after_100_trades() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let referrer = Address::generate(&env);
+        let (referee, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::set_referrer(env.clone(), referee.clone(), referrer.clone())
+                .unwrap();
+        });
+
+        // Execute exactly MAX_REFERRAL_TRADES trades
+        for _ in 0..MAX_REFERRAL_TRADES {
+            env.as_contract(&contract_id, || {
+                AutoTradeContract::execute_trade(
+                    env.clone(),
+                    referee.clone(),
+                    signal_id,
+                    OrderType::Market,
+                    10_000_000,
+                )
+                .unwrap();
+            });
+        }
+
+        let earnings_at_cap = env.as_contract(&contract_id, || {
+            AutoTradeContract::get_referral_stats(env.clone(), referrer.clone()).total_earnings
+        });
+
+        // 101st trade — no more reward
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                referee.clone(),
+                signal_id,
+                OrderType::Market,
+                10_000_000,
+            )
+            .unwrap();
+        });
+
+        env.as_contract(&contract_id, || {
+            let earnings_after =
+                AutoTradeContract::get_referral_stats(env.clone(), referrer.clone())
+                    .total_earnings;
+            assert_eq!(earnings_at_cap, earnings_after);
+        });
+    }
+
+    #[test]
+    fn test_no_reward_without_referral_on_trade() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let (user, signal_id) = setup_signal_and_user(&env, &contract_id);
+
+        env.as_contract(&contract_id, || {
+            AutoTradeContract::execute_trade(
+                env.clone(),
+                user.clone(),
+                signal_id,
+                OrderType::Market,
+                10_000_000,
+            )
+            .unwrap();
+
+            // No referrer set — stats should be empty
+            let stats = AutoTradeContract::get_referral_stats(env.clone(), user.clone());
+            assert_eq!(stats.total_earnings, 0);
+        });
+    }
+
+    // ── Dashboard queries ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_referral_stats_empty() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let user = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            let stats = AutoTradeContract::get_referral_stats(env.clone(), user.clone());
+            assert_eq!(stats.total_referrals, 0);
+            assert_eq!(stats.active_referrals, 0);
+            assert_eq!(stats.total_earnings, 0);
+        });
+    }
+
+    #[test]
+    fn test_get_referral_entry_none_for_unreferred_user() {
+        let env = setup_env();
+        let contract_id = env.register(AutoTradeContract, ());
+        let user = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            let entry = AutoTradeContract::get_referral_entry(env.clone(), user.clone());
+            assert!(entry.is_none());
+        });
+    }
+}

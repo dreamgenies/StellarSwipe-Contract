@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, symbol_short, Address, Env};
 
 #[contracttype]
 #[derive(Clone)]
@@ -24,4 +24,22 @@ pub fn get_signal(env: &Env, id: u64) -> Option<Signal> {
 /// Set a signal
 pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
     env.storage().persistent().set(&DataKey::Signal(id), signal);
+}
+
+/// Helper used in tests: grant a user a large default authorization so trades pass auth checks.
+pub fn authorize_user(env: &Env, user: &Address) {
+    use crate::auth::{AuthConfig, AuthKey};
+    let config = AuthConfig {
+        authorized: true,
+        max_trade_amount: i128::MAX,
+        expires_at: u64::MAX,
+        granted_at: env.ledger().timestamp(),
+    };
+    env.storage()
+        .persistent()
+        .set(&AuthKey::Authorization(user.clone()), &config);
+    // Also set a large balance so balance checks pass
+    env.storage()
+        .temporary()
+        .set(&(user.clone(), symbol_short!("balance")), &i128::MAX);
 }

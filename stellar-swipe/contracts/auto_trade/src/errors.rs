@@ -13,4 +13,9 @@ pub enum AutoTradeError {
     DailyTradeLimitExceeded = 7,
     PositionLimitExceeded = 8,
     StopLossTriggered = 9,
+    // Referral errors
+    SelfReferral = 10,
+    ReferralAlreadySet = 11,
+    CircularReferral = 12,
+    ReferralLimitExceeded = 13,
 }
