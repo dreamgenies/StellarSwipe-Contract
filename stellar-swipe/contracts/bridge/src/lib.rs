@@ -3,6 +3,7 @@
 pub mod monitoring;
 pub mod governance;
 pub mod analytics;
+pub mod fees;
 
 pub use monitoring::{
     ChainFinalityConfig, ChainId, MonitoredTransaction, MonitoringStatus, VerificationMethod,
@@ -30,4 +31,15 @@ pub use analytics::{
     VolumeStats, TimePeriod, AnalyticsMetric, Trend, TrendAnalysis,
     get_bridge_analytics, get_validator_analytics, get_bridge_volume_stats,
     calculate_bridge_health_score, compare_bridge_performance, analyze_volume_trend,
+};
+
+pub use fees::{
+    BridgeFeeConfig, BridgeFeeStats,
+    set_bridge_fee_config, get_bridge_fee_config,
+    get_bridge_fee_stats,
+    set_bridge_treasury, get_bridge_treasury,
+    calculate_bridge_fee, collect_bridge_fee,
+    distribute_validator_rewards, allocate_to_treasury,
+    adjust_bridge_fees_dynamically, calculate_bridge_utilization,
+    refund_bridge_fee,
 };
