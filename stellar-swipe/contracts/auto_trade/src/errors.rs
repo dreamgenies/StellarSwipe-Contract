@@ -1,5 +1,7 @@
+use soroban_sdk::contracterror;
+
+#[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
 pub enum AutoTradeError {
     InvalidAmount = 1,
     Unauthorized = 2,
@@ -72,58 +74,56 @@ feature/dca-strategy
  main
 
     TradingPaused = 10,
-
     StrategyNotFound = 11,
     PositionAlreadyExists = 12,
-    RankingDisabled = 13,
+ feat/smart-order-routing-84
+    InsufficientPriceHistory = 13,
+    RankingDisabled = 14,
+    InvalidBasketSize = 15,
 
+    RankingDisabled = 13,
     InvalidBasketSize = 14,
     InsufficientPriceHistory = 15,
+ main
     InvalidPriceData = 16,
     NonCointegratedBasket = 17,
     ActivePortfolioExists = 18,
     NoActivePortfolio = 19,
     NoTradeSignal = 20,
     InvalidStatArbConfig = 21,
-    
-    // Pairs Trading
+ feat/smart-order-routing-84
+    InvalidInsuranceConfig = 22,
+    InsuranceNotConfigured = 23,
+    SelfReferral = 24,
+    ReferralAlreadySet = 25,
+    CircularReferral = 26,
+    ReferralLimitExceeded = 27,
+    SlippageExceeded = 28,
+    RoutingPlanNotFound = 29,
+    AtomicExecutionFailed = 30,
+
     PairsStrategyNotFound = 22,
     PairsActivePositionExists = 23,
     PairsNoActivePosition = 24,
     InsufficientCorrelation = 25,
     PairNotCointegrated = 26,
     InvalidPairsConfig = 27,
- 
- main
-    // Arbitrage
     ArbitrageOpportunityExpired = 28,
     ArbitrageUnprofitable = 29,
     ArbTooLarge = 30,
     FrontRunningRisk = 31,
-
-    // Insurance
     InvalidInsuranceConfig = 32,
     InsuranceNotConfigured = 33,
-
-    // Referral
     SelfReferral = 34,
     ReferralAlreadySet = 35,
     CircularReferral = 36,
     ReferralLimitExceeded = 37,
-
- TWAP-Orders
-    // TWAP
     InvalidTWAPDuration = 38,
     TWAPOrderNotFound = 39,
     NotTWAPOwner = 40,
     TWAPNotActive = 41,
-
-Correlation-Based-Risk
-    // Correlation
     CorrelationLimitExceeded = 42,
     TooManyCorrelatedPositions = 43,
-
-    // Conditional Orders
     ConditionalOrderNotFound = 44,
     ConditionalOrderNotPending = 45,
     ConditionalOrderNotTriggered = 46,
@@ -138,6 +138,7 @@ Correlation-Based-Risk
  main
  main
 main
+ main
  main
  main
 }
