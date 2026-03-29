@@ -18,19 +18,12 @@ pub enum DataKey {
     Signal(u64),
 }
 
-/// Backwards-compatible helper for legacy tests.
+/// Test helper: auth plus max temporary SDEX balance.
 pub fn authorize_user(env: &Env, user: &Address) {
     authorize_user_with_limits(env, user, i128::MAX / 4, 30);
-}
-
-/// Get a signal by ID
-pub fn get_signal(env: &Env, id: u64) -> Option<Signal> {
-    env.storage().persistent().get(&DataKey::Signal(id))
-}
-
-/// Set a signal
-pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
-    env.storage().persistent().set(&DataKey::Signal(id), signal);
+    env.storage()
+        .temporary()
+        .set(&(user.clone(), symbol_short!("balance")), &i128::MAX);
 }
 
 pub fn authorize_user_with_limits(
@@ -55,4 +48,12 @@ pub fn revoke_user_authorization(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&AuthKey::Authorization(user.clone()));
+}
+
+pub fn get_signal(env: &Env, id: u64) -> Option<Signal> {
+    env.storage().persistent().get(&DataKey::Signal(id))
+}
+
+pub fn set_signal(env: &Env, id: u64, signal: &Signal) {
+    env.storage().persistent().set(&DataKey::Signal(id), signal);
 }

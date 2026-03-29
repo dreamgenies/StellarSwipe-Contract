@@ -1,5 +1,5 @@
 [package]
-name = "trade_executor"
+name = "fee_collector"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -13,3 +13,4 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
