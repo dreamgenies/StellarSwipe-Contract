@@ -282,7 +282,12 @@ pub fn on_grid_order_filled(
     }
 
     let level = filled_level.ok_or(AutoTradeError::SignalNotFound)?;
-    let filled_order = strategy.active_orders.remove(level).unwrap();
+    let filled_order = strategy
+        .active_orders
+        .get(level)
+        .ok_or(AutoTradeError::SignalNotFound)?;
+    let filled_for_profit = filled_order.clone();
+    strategy.active_orders.remove(level);
 
     strategy.filled_orders.push_back(FilledGridOrder {
         level: filled_order.level,
@@ -292,13 +297,14 @@ pub fn on_grid_order_filled(
         filled_at: env.ledger().timestamp(),
     });
 
-    if let Some(profit) = calculate_grid_profit(&strategy, &filled_order, fill_price, fill_amount)
+    if let Some(profit) =
+        calculate_grid_profit(&strategy, &filled_for_profit, fill_price, fill_amount)
     {
         strategy.total_profit += profit;
 
         #[allow(deprecated)]
         env.events().publish(
-            (Symbol::new(env, "grid_profit"), strategy_id, filled_order.level),
+            (Symbol::new(env, "grid_profit"), strategy_id, filled_for_profit.level),
             profit,
         );
     }

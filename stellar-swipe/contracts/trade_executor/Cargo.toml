@@ -1,0 +1,20 @@
+[package]
+name = "trade_executor"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+# auto_trade is invoked at runtime via contractimport (WASM); do not link the
+# auto_trade crate into this cdylib or the linker emits duplicate Soroban entrypoints.
+soroban-sdk = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[dev-dependencies]
+auto_trade = { path = "../auto_trade", features = ["testutils"] }

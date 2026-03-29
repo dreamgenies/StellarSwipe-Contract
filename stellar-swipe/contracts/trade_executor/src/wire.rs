@@ -1,6 +1,42 @@
-use soroban_sdk::contracterror;
+//! XDR-compatible mirrors of `auto_trade` types used only for `Env::try_invoke_contract`.
+//! Keep in sync with `contracts/auto_trade/src/lib.rs` and `contracts/auto_trade/src/errors.rs`.
 
-// export = false: large error surface exceeds default XDR spec case limit; runtime still uses u32 codes.
+use soroban_sdk::{contracterror, contracttype, Address};
+
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OrderType {
+    Market,
+    Limit,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TradeStatus {
+    Pending,
+    PartiallyFilled,
+    Filled,
+    Failed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trade {
+    pub signal_id: u64,
+    pub user: Address,
+    pub requested_amount: i128,
+    pub executed_amount: i128,
+    pub executed_price: i128,
+    pub timestamp: u64,
+    pub status: TradeStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeResult {
+    pub trade: Trade,
+}
+
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]

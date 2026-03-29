@@ -15,6 +15,7 @@ mod portfolio;
 mod portfolio_insurance;
 mod positions;
 mod referral;
+mod rate_limit;
 mod risk;
 mod risk_parity;
 mod sdex;
@@ -22,9 +23,14 @@ mod storage;
 mod strategies;
 mod twap;
 
+pub use errors::AutoTradeError;
+pub use risk::RiskConfig;
+
+#[cfg(feature = "testutils")]
+pub use storage::{set_signal, Signal};
+
 use crate::storage::DataKey;
 use advanced_risk::AutoSellResult;
-use errors::AutoTradeError;
 use stellar_swipe_common::emergency::{CAT_TRADING, PauseState};
 
 use risk_parity::{AssetRisk, RebalanceTrade};
@@ -562,11 +568,6 @@ impl AutoTradeContract {
         auth::get_auth_config(&env, &user)
     }
 
- feature/mean-reversion-strategy
-feature/mean-reversion-strategy
-
- feature/dca-strategy
- main
     // ── DCA ──────────────────────────────────────────────────────────────────
 
     pub fn create_dca(
@@ -626,7 +627,6 @@ feature/mean-reversion-strategy
         strategy_id: u64,
     ) -> Result<strategies::dca::DCAPerformance, AutoTradeError> {
         strategies::dca::analyze_dca_performance(&env, strategy_id)
- feature/mean-reversion-strategy
     }
 
     // ── Mean Reversion ────────────────────────────────────────────────────────
@@ -1024,7 +1024,6 @@ feature/mean-reversion-strategy
             asset_b,
             lookback_days,
         )
- main
     }
 
     // ── Correlation-Based Risk Management (Issue #correlation) ───────────────
@@ -1150,6 +1149,7 @@ feature/mean-reversion-strategy
     }
 }
 
+#[cfg(test)]
 mod test;
 
 // ── Correlation-Based Risk Management integration tests ───────────────────────
