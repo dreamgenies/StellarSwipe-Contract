@@ -6,16 +6,24 @@ pub use errors::ContractError;
 mod events;
 pub use events::{FeeRateUpdated, FeesClaimed, TreasuryWithdrawal, WithdrawalQueued};
 
+mod rebates;
+
 mod storage;
 pub use storage::{
-    get_admin, get_fee_rate, get_pending_fees, get_queued_withdrawal, get_treasury_balance,
-    is_initialized, remove_queued_withdrawal, set_admin, set_fee_rate as set_fee_rate_storage,
-    set_initialized, set_pending_fees, set_queued_withdrawal, set_treasury_balance,
-    QueuedWithdrawal, StorageKey, MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
+    get_admin, get_fee_rate, get_monthly_trade_volume, get_oracle_contract, get_pending_fees,
+    get_queued_withdrawal, get_treasury_balance, is_initialized, remove_monthly_trade_volume,
+    remove_queued_withdrawal, set_admin, set_fee_rate as set_fee_rate_storage, set_initialized,
+    set_monthly_trade_volume, set_oracle_contract as set_oracle_contract_storage, set_pending_fees,
+    set_queued_withdrawal, set_treasury_balance, MonthlyTradeVolume, QueuedWithdrawal, StorageKey,
+    MAX_FEE_RATE_BPS, MIN_FEE_RATE_BPS,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env};
+ refactor/157-shared-constants
 use stellar_swipe_common::SECONDS_PER_DAY;
+
+use stellar_swipe_common::Asset;
+ main
 
 #[cfg(test)]
 mod test;
@@ -33,6 +41,30 @@ impl FeeCollector {
         set_admin(&env, &admin);
         set_initialized(&env);
         Ok(())
+    }
+
+    pub fn set_oracle_contract(env: Env, oracle_contract: Address) -> Result<(), ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        let admin = get_admin(&env);
+        admin.require_auth();
+        set_oracle_contract_storage(&env, &oracle_contract);
+        Ok(())
+    }
+
+    pub fn fee_rate_for_user(env: Env, user: Address) -> Result<u32, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(rebates::get_fee_rate_for_user(&env, &user))
+    }
+
+    pub fn monthly_trade_volume(env: Env, user: Address) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(rebates::get_active_volume_usd(&env, &user))
     }
 
     pub fn treasury_balance(env: Env, token: Address) -> Result<i128, ContractError> {
@@ -164,6 +196,48 @@ impl FeeCollector {
         .publish(&env);
 
         Ok(())
+    }
+
+    pub fn collect_fee(
+        env: Env,
+        trader: Address,
+        token: Address,
+        trade_amount: i128,
+        trade_asset: Asset,
+    ) -> Result<i128, ContractError> {
+        if !is_initialized(&env) {
+            return Err(ContractError::NotInitialized);
+        }
+        trader.require_auth();
+
+        if trade_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let fee_rate = rebates::get_fee_rate_for_user(&env, &trader);
+        let fee_amount = trade_amount
+            .checked_mul(fee_rate as i128)
+            .and_then(|amount| amount.checked_div(10_000))
+            .ok_or(ContractError::ArithmeticOverflow)?;
+
+        if fee_amount <= 0 {
+            return Err(ContractError::FeeRoundedToZero);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &trader,
+            &env.current_contract_address(),
+            &fee_amount,
+        );
+
+        let updated_treasury_balance = get_treasury_balance(&env, &token)
+            .checked_add(fee_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        set_treasury_balance(&env, &token, updated_treasury_balance);
+
+        rebates::record_trade_volume(&env, &trader, &trade_asset, trade_amount)?;
+
+        Ok(fee_amount)
     }
 
     /// Claim all pending fee earnings for a provider and token.

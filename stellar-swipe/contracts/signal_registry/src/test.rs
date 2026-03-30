@@ -3,8 +3,9 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env, vec, String};
-use crate::categories::{SignalCategory, RiskLevel};
+use crate::categories::{RiskLevel, SignalCategory};
+use crate::errors::AdminError;
+use soroban_sdk::{testutils::Address as _, vec, Env, String};
 
 #[test]
 fn test_initialize_and_admin() {
@@ -290,12 +291,12 @@ fn test_unauthorized_admin_actions() {
 
     // Attacker tries to transfer admin
     let new_admin = Address::generate(&env);
-    let result = client.try_transfer_admin(&attacker, &new_admin);
+    let result = client.try_propose_admin_transfer(&attacker, &new_admin);
     assert!(result.is_err());
 }
 
 #[test]
-fn test_transfer_admin() {
+fn test_two_step_admin_transfer_flow() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -307,7 +308,14 @@ fn test_transfer_admin() {
     let admin2 = Address::generate(&env);
 
     client.initialize(&admin1);
-    client.transfer_admin(&admin1, &admin2);
+    client.propose_admin_transfer(&admin1, &admin2);
+
+    // Old admin remains active until the pending admin accepts.
+    client.pause_trading(&admin1);
+    assert!(client.is_paused());
+    client.unpause_trading(&admin1);
+
+    client.accept_admin_transfer(&admin2);
 
     let current_admin = client.get_admin();
     assert_eq!(current_admin, admin2);
@@ -319,6 +327,72 @@ fn test_transfer_admin() {
     // New admin should work
     client.pause_trading(&admin2);
     assert!(client.is_paused());
+}
+
+#[test]
+fn test_admin_transfer_expires() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+
+    use soroban_sdk::testutils::Ledger;
+    env.ledger()
+        .with_mut(|ledger| ledger.sequence_number += 34_560 + 1);
+
+    let result = client.try_accept_admin_transfer(&pending_admin);
+    assert_eq!(result, Err(Ok(AdminError::AdminTransferExpired)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_admin_transfer_can_be_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+    client.cancel_admin_transfer(&admin);
+
+    let result = client.try_accept_admin_transfer(&pending_admin);
+    assert_eq!(result, Err(Ok(AdminError::NoPendingAdminTransfer)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_only_pending_admin_can_accept_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let pending_admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    client.initialize(&admin);
+    client.propose_admin_transfer(&admin, &pending_admin);
+
+    let result = client.try_accept_admin_transfer(&attacker);
+    assert_eq!(result, Err(Ok(AdminError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
 }
 
 #[test]
