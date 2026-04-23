@@ -1,4 +1,5 @@
 #![cfg(test)]
+//! Additional integration tests; stop-loss / take-profit coverage is in `triggers::tests`.
 
 use crate::{
     errors::{ContractError, InsufficientBalanceDetail},
