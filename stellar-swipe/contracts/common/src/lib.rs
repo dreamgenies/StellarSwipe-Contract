@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod assets;
+pub mod commit_reveal;
 pub mod constants;
 pub mod emergency;
 pub mod health;
@@ -9,6 +10,7 @@ pub mod rate_limit;
 pub mod replay_protection;
 
 pub use assets::{validate_asset_pair, Asset, AssetPair, AssetPairError};
+pub use commit_reveal::hash_trade_intent;
 pub use constants::{
     BASIS_POINTS_DENOMINATOR, BASIS_POINTS_DENOMINATOR_I128, CAT_ALL, CAT_SIGNALS, CAT_STAKES,
     CAT_TRADING, LEDGERS_PER_30_DAY_MONTH, LEDGERS_PER_DAY, PLACEHOLDER_ADMIN_STR,

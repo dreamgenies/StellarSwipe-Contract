@@ -24,17 +24,20 @@ mod submission;
 mod templates;
 mod test_reputation;
 mod types;
+mod migration;
 mod versioning;
+
+pub use categories::{RiskLevel, SignalCategory};
+pub use types::SignalAction;
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused,
     require_not_paused_legacy as require_not_paused, AdminConfig,
 };
-use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
+use stellar_swipe_common::emergency::PauseState;
 use stellar_swipe_common::rate_limit::{self as rl, ActionType as RLAction, RateLimitConfig};
 use stellar_swipe_common::SECONDS_PER_30_DAY_MONTH;
 
-use categories::{RiskLevel, SignalCategory};
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
     get_combo_performance, ComboExecution, ComboPerformanceSummary, ComboSignal, ComboType,
@@ -53,14 +56,17 @@ use reputation::{
     calculate_trust_score, get_trust_score, update_median_values, update_trust_score,
     TrustScoreDetails, TrustScoreTier,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, Env, IntoVal, Map, String, Symbol, Val,
+    Vec,
+};
 use stellar_swipe_common::{health_uninitialized, placeholder_admin, HealthStatus};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
     AddressMapping, Asset, CrossChainSignal, FeeBreakdown, ImportResultView, ProviderPerformance,
-    RecurrencePattern, Signal, SignalAction, SignalData, SignalEditInput, SignalOutcome,
-    SignalPerformanceView, SignalStatus, SignalSummary, SortOption, SyncStatus, TradeExecution,
+    RecurrencePattern, Signal, SignalData, SignalEditInput, SignalOutcome, SignalPerformanceView,
+    SignalStatus, SignalSummary, SortOption, SyncStatus, TradeExecution,
 };
 use versioning::{CopyRecord, SignalVersion};
 
@@ -74,6 +80,12 @@ pub struct SignalRegistry;
 pub enum StorageKey {
     SignalCounter,
     Signals,
+    /// Legacy v1 signal map (pre-upgrade). Cleared as rows migrate to [`StorageKey::Signals`].
+    SignalsV1,
+    /// Next signal id to scan for v1→v2 migration (1-based, advances per batch).
+    MigrationCursor,
+    /// Snapshot count of v1 keys at migration start (for `MigrationProgress.total_count`).
+    MigrationV1TargetTotal,
     ProviderStats,
     /// Per-provider stake balances for trust and submission gates.
     ProviderStakes,
@@ -93,8 +105,8 @@ pub enum StorageKey {
     AdoptionNonces,
     /// Authorized TradeExecutor contract address (set by admin).
     TradeExecutor,
-    /// Address allowed to call `set_ai_score` (off-chain AI integration).
-    AiOracle,
+    /// Canonical UserPortfolio used for PREMIUM subscription checks (`check_subscription`).
+    UserPortfolio,
     /// Recorded post-close outcomes per signal (Issue #170).
     RecordedSignalOutcomes,
     /// Rolling reputation score per provider (Issue #170).
@@ -123,6 +135,18 @@ impl SignalRegistry {
             .instance()
             .set(&StorageKey::TradeExecutor, &executor);
         Ok(())
+    }
+
+    /// Admin: migrate batched v1 signal records from [`StorageKey::SignalsV1`] into v2
+    /// [`StorageKey::Signals`]. Idempotent; safe to call until all v1 rows are gone.
+    pub fn migrate_signals_v1_to_v2(
+        env: Env,
+        caller: Address,
+        batch_size: u32,
+    ) -> Result<(), AdminError> {
+        admin::require_admin(&env, &caller)?;
+        caller.require_auth();
+        migration::migrate_signals_v1_to_v2(&env, &caller, batch_size)
     }
 
     /* =========================
@@ -634,46 +658,46 @@ impl SignalRegistry {
         signals.get(signal_id)
     }
 
-    /// Admin: configure the address that may invoke [`Self::set_ai_score`] (xAI / validation worker).
-    pub fn set_ai_oracle(env: Env, caller: Address, oracle: Address) -> Result<(), AdminError> {
-        admin::require_admin(&env, &caller)?;
-        caller.require_auth();
-        env.storage()
-            .instance()
-            .set(&StorageKey::AiOracle, &oracle);
-        Ok(())
-    }
-
-    /// Authorized AI oracle only: persist `score` in \[0, 100\] on the signal (`None` until set).
-    pub fn set_ai_score(
+    /// Return the signal if `viewer` is allowed to see it. Non-[`SignalCategory::PREMIUM`]
+    /// signals are visible to any viewer. PREMIUM signals require an active on-chain
+    /// subscription (via UserPortfolio [`check_subscription`]) unless the viewer is the
+    /// signal provider.
+    pub fn get_signal_for_viewer(
         env: Env,
-        caller: Address,
         signal_id: u64,
-        score: u32,
-    ) -> Result<(), AiScoreError> {
-        caller.require_auth();
-        let oracle: Address = env
+        viewer: Address,
+    ) -> Option<Signal> {
+        let signals = Self::get_signals_map(&env);
+        let signal = signals.get(signal_id)?;
+        if signal.category != SignalCategory::PREMIUM {
+            return Some(signal);
+        }
+        if viewer == signal.provider {
+            return Some(signal);
+        }
+        let portfolio: Address = env
             .storage()
             .instance()
-            .get(&StorageKey::AiOracle)
-            .ok_or(AiScoreError::OracleNotConfigured)?;
-        if caller != oracle {
-            return Err(AiScoreError::Unauthorized);
+            .get(&StorageKey::UserPortfolio)?;
+        let allowed = Self::invoke_check_subscription(&env, &portfolio, &viewer, &signal.provider);
+        if allowed {
+            Some(signal)
+        } else {
+            None
         }
-        if score > 100 {
-            return Err(AiScoreError::InvalidScore);
-        }
+    }
 
-        let mut signals = Self::get_signals_map(&env);
-        let mut signal = signals
-            .get(signal_id)
-            .ok_or(AiScoreError::SignalNotFound)?;
-        signal.ai_validation_score = Some(score);
-        signals.set(signal_id, signal.clone());
-        Self::save_signals_map(&env, &signals);
-
-        events::emit_ai_score_set(&env, signal_id, score, caller);
-        Ok(())
+    fn invoke_check_subscription(
+        env: &Env,
+        portfolio: &Address,
+        user: &Address,
+        provider: &Address,
+    ) -> bool {
+        let sym = Symbol::new(env, "check_subscription");
+        let mut args = Vec::<Val>::new(env);
+        args.push_back(user.clone().into_val(env));
+        args.push_back(provider.clone().into_val(env));
+        env.invoke_contract::<bool>(portfolio, &sym, args)
     }
 
     /// Edit price, rationale hash, or confidence within 60s of `submitted_at` (Issue #168).
@@ -2127,6 +2151,8 @@ impl SignalRegistry {
 }
 
 #[cfg(test)]
+mod test;
+#[cfg(test)]
 mod test_adoption;
 #[cfg(test)]
 mod test_combos;
@@ -2135,12 +2161,10 @@ mod test_contests;
 #[cfg(test)]
 mod test_emergency;
 #[cfg(test)]
+mod test_health;
+#[cfg(test)]
 mod test_scheduling;
 #[cfg(test)]
 mod test_signal_issues;
 #[cfg(test)]
 mod test_admin_transfer;
-#[cfg(test)]
-mod test_health;
-#[cfg(test)]
-mod test_ai_score;

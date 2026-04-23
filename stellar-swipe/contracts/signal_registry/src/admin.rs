@@ -10,6 +10,7 @@ use crate::events::*;
 // Constants
 pub const MAX_FEE_BPS: u32 = 100; // 1% max fee
 pub const MAX_RISK_PERCENTAGE: u32 = 100; // 100% max
+/// Wall-clock admin transfer validity (matches admin transfer tests).
 const ADMIN_TRANSFER_EXPIRY_SECS: u64 = 48 * 60 * 60;
 
 // Default values
@@ -43,6 +44,7 @@ pub enum AdminStorageKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAdminTransfer {
     pub pending_admin: Address,
+    /// Unix timestamp (seconds) after which the proposal cannot be accepted.
     pub expires_at: u64,
 }
 
@@ -176,8 +178,7 @@ fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminTransfer> {
 
 fn require_active_pending_admin_transfer(env: &Env) -> Result<PendingAdminTransfer, AdminError> {
     let pending = get_pending_admin_transfer(env).ok_or(AdminError::PendingAdminNotFound)?;
-    let now = env.ledger().timestamp();
-    if now >= pending.expires_at {
+    if env.ledger().sequence() > pending.expires_at_ledger {
         env.storage()
             .instance()
             .remove(&AdminStorageKey::PendingAdminTransfer);
@@ -207,7 +208,7 @@ pub fn propose_admin_transfer(
         .instance()
         .set(&AdminStorageKey::PendingAdminTransfer, &pending);
 
-    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at);
+    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger as u64);
     Ok(())
 }
 
