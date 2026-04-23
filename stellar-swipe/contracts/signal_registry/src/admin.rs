@@ -178,8 +178,7 @@ fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminTransfer> {
 
 fn require_active_pending_admin_transfer(env: &Env) -> Result<PendingAdminTransfer, AdminError> {
     let pending = get_pending_admin_transfer(env).ok_or(AdminError::PendingAdminNotFound)?;
-    let now = env.ledger().timestamp();
-    if now >= pending.expires_at {
+    if env.ledger().sequence() > pending.expires_at_ledger {
         env.storage()
             .instance()
             .remove(&AdminStorageKey::PendingAdminTransfer);
@@ -209,7 +208,7 @@ pub fn propose_admin_transfer(
         .instance()
         .set(&AdminStorageKey::PendingAdminTransfer, &pending);
 
-    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at);
+    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger as u64);
     Ok(())
 }
 
