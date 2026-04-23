@@ -19,7 +19,6 @@ pub use emergency::PauseState;
 pub use health::{health_uninitialized, placeholder_admin, HealthStatus};
 pub use oracle::{IOracleClient, MockOracleClient, OnChainOracleClient, OracleError, OraclePrice};
 pub use rate_limit::{
-    check_rate_limit, record_action, set_config as set_rate_limit_config, ActionType,
-    RateLimitConfig,
+    check_rate_limit, record_action, set_config as set_rate_limit_config, ActionType, RateLimitConfig,
 };
 pub use replay_protection::{current_nonce, verify_and_commit, ReplayError};
