@@ -1,5 +1,6 @@
 #![cfg(test)]
-//! Additional integration tests; stop-loss / take-profit coverage is in `triggers::tests`.
+//! Integration tests for TradeExecutor.
+//! Stop-loss / take-profit coverage is in `triggers::tests`.
 
 use crate::{
     errors::{ContractError, InsufficientBalanceDetail},
@@ -31,9 +32,9 @@ enum MockKey {
 
 #[contractimpl]
 impl MockUserPortfolio {
-    /// Batched entrypoint (Issue #306): atomically checks the position cap and records
-    /// the new copy position. Panics when `open_count >= max_positions` so that
-    /// `try_invoke_contract` surfaces it as `PositionLimitReached`.
+    /// Batched entrypoint: atomically checks the position cap and records the new copy
+    /// position. Panics when `open_count >= max_positions` so that `try_invoke_contract`
+    /// surfaces it as `PositionLimitReached`.
     pub fn validate_and_record(env: Env, user: Address, max_positions: u32) -> u32 {
         let key = MockKey::OpenCount(user.clone());
         let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
@@ -85,6 +86,7 @@ fn setup_with_balance(user_balance: i128) -> (Env, Address, Address, Address, Ad
     let user = Address::generate(&env);
     let token = sac_token(&env);
     let portfolio_id = env.register(MockUserPortfolio, ());
+    let router_id = env.register(MockSdexRouter, ());
     let exec_id = env.register(TradeExecutorContract, ());
 
     StellarAssetClient::new(&env, &token).mint(&user, &user_balance);
@@ -266,6 +268,28 @@ fn whitelisted_user_bypasses_position_limit() {
         )
     });
     assert_eq!(err2, Err(ContractError::PositionLimitReached));
+}
+
+// ── Auth propagation: execute_copy_trade ─────────────────────────────────────
+
+/// execute_copy_trade requires user.require_auth() — calling without auth must fail.
+#[test]
+fn execute_copy_trade_requires_user_auth() {
+    let per = TRADE_AMOUNT + DEFAULT_ESTIMATED_COPY_TRADE_FEE;
+    let (env, exec_id, _pf, user, _admin, token) = setup_with_balance(per + 1_000_000);
+
+    // Do NOT mock auths — call without any auth context.
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::execute_copy_trade(
+            env.clone(),
+            user.clone(),
+            token.clone(),
+            TRADE_AMOUNT,
+        )
+    });
+    // Without mock_all_auths the require_auth() panics, surfaced as an error.
+    // We just verify the call does not succeed silently.
+    assert!(err.is_err(), "execute_copy_trade must require user auth");
 }
 
 // ── Reentrancy guard tests ────────────────────────────────────────────────────
@@ -490,14 +514,15 @@ fn swap_with_slippage_reverts_when_exceeded() {
 
 // ── cancel_copy_trade tests ───────────────────────────────────────────────────
 
+#[contracttype]
+#[derive(Clone)]
+enum PortfolioKey {
+    Position(Address, u64),
+    LastClosed,
+}
+
 #[contract]
 pub struct MockPortfolioWithPositions;
-
-/// Unfilled trade expires after timeout; keeper can call without user auth; TradeExpired emitted.
-#[test]
-fn expire_trade_unfilled_after_timeout_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
 
 #[contractimpl]
 impl MockPortfolioWithPositions {
@@ -552,12 +577,7 @@ fn setup_cancel(router_out: i128) -> (Env, Address, Address, Address, Address, A
 
     StellarAssetClient::new(&env, &token_a).mint(&exec_id, &1_000_000_000);
 
-    env.ledger().with_mut(|l| l.sequence_number = 200);
-
-    let err = env.as_contract(&exec_id, || {
-        TradeExecutorContract::expire_trade(env.clone(), 2u64)
-    });
-    assert_eq!(err, Err(ContractError::TradeAlreadyFilled));
+    (env, exec_id, portfolio_id, user, token_a, token_b, admin)
 }
 
 #[test]
@@ -639,4 +659,29 @@ fn cancel_copy_trade_pnl_calculation() {
             .unwrap_or(false)
     });
     assert!(found, "TradeCancelled event not emitted");
+}
+
+// ── Auth propagation: cancel_copy_trade ──────────────────────────────────────
+
+/// cancel_copy_trade requires caller == user; a third party must be rejected.
+#[test]
+fn cancel_copy_trade_third_party_rejected() {
+    let (env, exec_id, portfolio_id, user, token_a, token_b, _) = setup_cancel(1_000_000);
+    let third_party = Address::generate(&env);
+
+    MockPortfolioWithPositionsClient::new(&env, &portfolio_id).add_position(&user, &5u64);
+
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::cancel_copy_trade(
+            env.clone(),
+            third_party.clone(),
+            user.clone(),
+            5u64,
+            token_a,
+            token_b,
+            1_000_000,
+            900_000,
+        )
+    });
+    assert_eq!(err, Err(ContractError::Unauthorized));
 }

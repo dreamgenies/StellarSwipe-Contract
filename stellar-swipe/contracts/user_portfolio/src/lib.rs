@@ -67,6 +67,19 @@ impl UserPortfolio {
         env.storage().instance().set(&DataKey::Oracle, &oracle);
     }
 
+    /// Admin: register the TradeExecutor contract that is allowed to call
+    /// `close_position_keeper` on behalf of keepers.
+    pub fn set_trade_executor(env: Env, trade_executor: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::TradeExecutor, &trade_executor);
+    }
+
+    pub fn get_trade_executor(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TradeExecutor)
+    }
+
     pub fn set_oracle_asset_pair(env: Env, asset_pair: u32) {
         Self::require_admin(&env);
         env.storage()
@@ -173,6 +186,87 @@ impl UserPortfolio {
                 (position_id, asset_pair, pos.entry_price, exit_price, pnl_bps, signal_provider, signal_id),
             );
         }
+    }
+
+    /// Keeper-callable position close: used by TradeExecutor for stop-loss / take-profit
+    /// triggers. Does NOT require user signature; instead verifies that the caller is
+    /// the registered TradeExecutor contract.
+    ///
+    /// ## Auth model
+    /// - `caller` must be the registered TradeExecutor address (set by admin via
+    ///   `set_trade_executor`). The caller must sign the transaction (i.e. the
+    ///   TradeExecutor contract itself is the transaction source or sub-invocation
+    ///   authoriser).
+    /// - No user signature required (keeper pattern).
+    ///
+    /// ## Parameters
+    /// - `caller`: must equal the registered TradeExecutor
+    /// - `user`: position owner
+    /// - `position_id`: position to close
+    /// - `asset_pair`: asset pair for event emission (informational)
+    ///
+    /// Realized P&L is set to 0 (keeper closes do not calculate P&L; that is done
+    /// off-chain or in a separate settlement step).
+    pub fn close_position_keeper(
+        env: Env,
+        caller: Address,
+        user: Address,
+        position_id: u64,
+        asset_pair: u32,
+    ) {
+        // Require the caller to authorise this call.
+        caller.require_auth();
+
+        // Verify caller is the registered TradeExecutor.
+        let trade_executor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TradeExecutor)
+            .expect("trade executor not set");
+        if caller != trade_executor {
+            panic!("unauthorized: only trade executor can call close_position_keeper");
+        }
+
+        // Verify position exists and belongs to user.
+        let key = DataKey::UserPositions(user.clone());
+        let list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for i in 0..list.len() {
+            if let Some(pid) = list.get(i) {
+                if pid == position_id {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            panic!("position not found for user");
+        }
+
+        let pkey = DataKey::Position(position_id);
+        let mut pos: Position = env
+            .storage()
+            .persistent()
+            .get(&pkey)
+            .expect("position missing");
+        if pos.status != PositionStatus::Open {
+            panic!("position not open");
+        }
+
+        // Close position with zero P&L (keeper closes don't calculate P&L).
+        pos.status = PositionStatus::Closed;
+        pos.realized_pnl = 0;
+        env.storage().persistent().set(&pkey, &pos);
+
+        // Emit event for keeper close (no TradeShareable since pnl=0).
+        env.events().publish(
+            (Symbol::new(&env, "PositionClosedByKeeper"), user.clone()),
+            (position_id, asset_pair),
+        );
     }
 
     /// Portfolio P&L including open positions when oracle price is available.
