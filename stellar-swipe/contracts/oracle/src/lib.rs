@@ -20,7 +20,7 @@ use reputation::{
 };
 use sdex::{calculate_spot_price, OrderBook, OrderEntry};
 use soroban_sdk::{contract, contractimpl, symbol_short, vec, Address, Env, Map, String, Vec};
-use staleness::StalenessLevel;
+use staleness::{OracleHealth, OracleStatus, StalenessLevel};
 use stellar_swipe_common::emergency::{PauseState, CAT_ALL};
 use stellar_swipe_common::{
     health_uninitialized, placeholder_admin, Asset, AssetPair, HealthStatus,
@@ -79,6 +79,7 @@ impl OracleContract {
         storage::set_price(&env, &pair, price);
         storage::add_available_pair(&env, pair.clone());
         history::store_price(&env, &pair, price);
+        on_price_update(&env, pair);
         Ok(())
     }
 
@@ -128,6 +129,13 @@ impl OracleContract {
     /// Get historical price at timestamp
     pub fn get_historical_price(env: Env, pair: AssetPair, timestamp: u64) -> Option<i128> {
         history::get_historical_price(&env, &pair, timestamp)
+    }
+
+    /// Check oracle heartbeat health for a pair using ledger freshness.
+    pub fn check_oracle_heartbeat(env: Env, pair: AssetPair) -> OracleHealth {
+        let health = staleness::check_oracle_heartbeat(&env, &pair);
+        maybe_emit_heartbeat_missed(&env, &pair, &health);
+        health
     }
 
     /// Get current pause states
@@ -626,6 +634,7 @@ impl OracleContract {
         let consensus_price = crate::external_adapter::process_external_prices(&env, prices)?;
         if let Some(pair) = first_pair {
             storage::set_price(&env, &pair, consensus_price);
+            on_price_update(&env, pair);
         }
 
         Ok(consensus_price)
@@ -668,8 +677,28 @@ pub fn on_price_update(env: &Env, pair: AssetPair) {
     }
 
     metadata.last_update = env.ledger().timestamp();
+    metadata.last_update_ledger = env.ledger().sequence();
     metadata.update_count_24h += 1;
+    metadata.last_heartbeat_status = OracleStatus::Healthy;
     staleness::set_metadata(env, &pair, metadata);
+}
+
+fn maybe_emit_heartbeat_missed(env: &Env, pair: &AssetPair, health: &OracleHealth) {
+    if health.status == OracleStatus::Healthy {
+        return;
+    }
+
+    let mut metadata = staleness::get_metadata(env, pair);
+    if metadata.last_heartbeat_status != health.status {
+        events::emit_oracle_heartbeat_missed(
+            env,
+            health.status.clone(),
+            health.last_update_ledger,
+            health.ledgers_since_update,
+        );
+        metadata.last_heartbeat_status = health.status.clone();
+        staleness::set_metadata(env, pair, metadata);
+    }
 }
 
 #[cfg(test)]
