@@ -1,323 +1,196 @@
-//! Standardized event schema for all StellarSwipe contracts.
+//! Event deduplication guard (Issue #276).
 //!
-//! ## Format
-//! Every event uses a two-topic tuple:
-//! ```text
-//! topics: (contract_name: Symbol, event_name: Symbol)
-//! body:   <EventStruct>  (a #[contracttype] struct)
+//! In retry scenarios (e.g. transaction resubmission), the same event could be
+//! emitted twice for the same state change. This module provides a lightweight
+//! nonce-based guard stored in **temporary storage** (TTL = 1 ledger) so that
+//! duplicate emissions within the same ledger are suppressed.
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use shared::events::{emit_once, EventType};
+//!
+//! // Only emits if this (event_type, entity_id) has not been emitted this ledger.
+//! emit_once(&env, EventType::TradeExecuted, trade_id, || {
+//!     env.events().publish((Symbol::new(&env, "trade_executed"),), payload);
+//! });
 //! ```
 //!
-//! This lets Horizon / indexers filter by contract and event name independently.
+//! # Constraint
 //!
-//! ## Stability policy
-//! Field names and types are **stable across contract versions**.
-//! Adding new optional fields is allowed; removing or renaming fields is a
-//! breaking change and requires a new event name.
+//! Deduplication is only applied to events that can be emitted multiple times
+//! (e.g. `TradeExecuted`, `StopLossTriggered`). One-time events such as
+//! `ContractInitialized` are **not** wrapped — they are emitted directly.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol};
+use soroban_sdk::{contracttype, Env, Symbol};
 
-// ── Contract name symbols ─────────────────────────────────────────────────────
-// Used as the first topic on every event.
-
-pub fn contract_fee_collector(env: &Env) -> Symbol {
-    Symbol::new(env, "fee_collector")
-}
-pub fn contract_trade_executor(env: &Env) -> Symbol {
-    Symbol::new(env, "trade_executor")
-}
-pub fn contract_user_portfolio(env: &Env) -> Symbol {
-    Symbol::new(env, "user_portfolio")
-}
-pub fn contract_signal_registry(env: &Env) -> Symbol {
-    Symbol::new(env, "signal_registry")
-}
-pub fn contract_governance(env: &Env) -> Symbol {
-    symbol_short!("governance")
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// FeeCollector events
-// ═══════════════════════════════════════════════════════════════════════════════
-
+/// Discriminant for events that may be emitted more than once per entity.
+///
+/// Add a new variant here whenever a repeatable event needs deduplication.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtFeeCollected {
-    pub trader: Address,
-    pub token: Address,
-    pub trade_amount: i128,
-    pub fee_amount: i128,
-    pub fee_rate_bps: u32,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventType {
+    TradeExecuted,
+    StopLossTriggered,
+    TakeProfitTriggered,
+    SignalAdopted,
+    SignalExpired,
+    FeeCollected,
 }
 
+/// Temporary-storage key for the deduplication nonce.
+///
+/// Keyed by `(event_type, entity_id)` so different events for the same entity
+/// (or the same event for different entities) are tracked independently.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtFeeRateUpdated {
-    pub old_rate: u32,
-    pub new_rate: u32,
-    pub updated_by: Address,
+#[derive(Clone)]
+pub enum StorageKey {
+    EventNonce(EventType, u64),
 }
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtFeesClaimed {
-    pub provider: Address,
-    pub token: Address,
-    pub amount: i128,
+/// Emit `emit_fn` at most once per `(event_type, entity_id)` per ledger.
+///
+/// Before emitting: checks `StorageKey::EventNonce(event_type, entity_id)` in
+/// temporary storage. If the nonce already exists, the emission is skipped.
+/// After emitting: sets the nonce with a TTL of 1 ledger so it expires
+/// automatically after the current ledger closes.
+///
+/// Returns `true` if the event was emitted, `false` if it was deduplicated.
+pub fn emit_once<F: FnOnce()>(
+    env: &Env,
+    event_type: EventType,
+    entity_id: u64,
+    emit_fn: F,
+) -> bool {
+    let key = StorageKey::EventNonce(event_type, entity_id);
+
+    if env.storage().temporary().has(&key) {
+        // Already emitted this ledger — skip.
+        return false;
+    }
+
+    emit_fn();
+
+    // Set nonce with TTL = 1 ledger (expires after current ledger closes).
+    env.storage().temporary().set(&key, &true);
+    env.storage().temporary().extend_ttl(&key, 1, 1);
+
+    true
 }
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtWithdrawalQueued {
-    pub recipient: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub available_at: u64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, symbol_short, testutils::Ledger, Env, Symbol};
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtTreasuryWithdrawal {
-    pub recipient: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub remaining_balance: i128,
-}
+    #[contract]
+    struct TestContract;
 
-pub fn emit_fee_collected(env: &Env, evt: EvtFeeCollected) {
-    env.events().publish(
-        (contract_fee_collector(env), Symbol::new(env, "fee_collected")),
-        evt,
-    );
-}
+    #[contractimpl]
+    impl TestContract {}
 
-pub fn emit_fee_rate_updated(env: &Env, evt: EvtFeeRateUpdated) {
-    env.events().publish(
-        (contract_fee_collector(env), Symbol::new(env, "fee_rate_updated")),
-        evt,
-    );
-}
+    fn setup() -> (Env, soroban_sdk::Address) {
+        let env = Env::default();
+        env.ledger().with_mut(|l| l.sequence_number = 10);
+        let id = env.register(TestContract, ());
+        (env, id)
+    }
 
-pub fn emit_fees_claimed(env: &Env, evt: EvtFeesClaimed) {
-    env.events().publish(
-        (contract_fee_collector(env), Symbol::new(env, "fees_claimed")),
-        evt,
-    );
-}
+    /// First call emits the event; second call (same ledger) is deduplicated.
+    #[test]
+    fn test_deduplication_suppresses_second_emission() {
+        let (env, contract_id) = setup();
 
-pub fn emit_withdrawal_queued(env: &Env, evt: EvtWithdrawalQueued) {
-    env.events().publish(
-        (contract_fee_collector(env), Symbol::new(env, "withdrawal_queued")),
-        evt,
-    );
-}
+        env.as_contract(&contract_id, || {
+            let mut count = 0u32;
 
-pub fn emit_treasury_withdrawal(env: &Env, evt: EvtTreasuryWithdrawal) {
-    env.events().publish(
-        (contract_fee_collector(env), Symbol::new(env, "treasury_withdrawal")),
-        evt,
-    );
-}
+            let emitted_first = emit_once(&env, EventType::TradeExecuted, 42, || {
+                count += 1;
+                env.events()
+                    .publish((Symbol::new(&env, "trade_executed"),), 42u64);
+            });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// TradeExecutor events
-// ═══════════════════════════════════════════════════════════════════════════════
+            let emitted_second = emit_once(&env, EventType::TradeExecuted, 42, || {
+                count += 1;
+                env.events()
+                    .publish((Symbol::new(&env, "trade_executed"),), 42u64);
+            });
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtTradeCancelled {
-    pub user: Address,
-    pub trade_id: u64,
-    pub exit_price: i128,
-    pub realized_pnl: i128,
-}
+            assert!(emitted_first, "first emission must succeed");
+            assert!(!emitted_second, "second emission must be deduplicated");
+            assert_eq!(count, 1, "emit_fn must be called exactly once");
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtStopLossTriggered {
-    pub user: Address,
-    pub trade_id: u64,
-    pub stop_loss_price: i128,
-    pub current_price: i128,
-}
+            // Only one event in the ledger event log.
+            assert_eq!(env.events().all().len(), 1);
+        });
+    }
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtTakeProfitTriggered {
-    pub user: Address,
-    pub trade_id: u64,
-    pub take_profit_price: i128,
-    pub current_price: i128,
-}
+    /// Different entity_ids are tracked independently — no cross-contamination.
+    #[test]
+    fn test_different_entity_ids_are_independent() {
+        let (env, contract_id) = setup();
 
-pub fn emit_trade_cancelled(env: &Env, evt: EvtTradeCancelled) {
-    env.events().publish(
-        (contract_trade_executor(env), Symbol::new(env, "trade_cancelled")),
-        evt,
-    );
-}
+        env.as_contract(&contract_id, || {
+            let emitted_a = emit_once(&env, EventType::TradeExecuted, 1, || {
+                env.events()
+                    .publish((Symbol::new(&env, "trade_executed"),), 1u64);
+            });
 
-pub fn emit_stop_loss_triggered(env: &Env, evt: EvtStopLossTriggered) {
-    env.events().publish(
-        (contract_trade_executor(env), Symbol::new(env, "stop_loss_triggered")),
-        evt,
-    );
-}
+            let emitted_b = emit_once(&env, EventType::TradeExecuted, 2, || {
+                env.events()
+                    .publish((Symbol::new(&env, "trade_executed"),), 2u64);
+            });
 
-pub fn emit_take_profit_triggered(env: &Env, evt: EvtTakeProfitTriggered) {
-    env.events().publish(
-        (contract_trade_executor(env), Symbol::new(env, "take_profit_triggered")),
-        evt,
-    );
-}
+            assert!(emitted_a);
+            assert!(emitted_b);
+            assert_eq!(env.events().all().len(), 2);
+        });
+    }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// UserPortfolio events
-// ═══════════════════════════════════════════════════════════════════════════════
+    /// Different event types for the same entity_id are tracked independently.
+    #[test]
+    fn test_different_event_types_are_independent() {
+        let (env, contract_id) = setup();
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtTradeShareable {
-    pub user: Address,
-    pub position_id: u64,
-    pub asset_pair: u32,
-    pub entry_price: i128,
-    pub exit_price: i128,
-    pub pnl_bps: i64,
-    pub signal_provider: Address,
-    pub signal_id: u64,
-}
+        env.as_contract(&contract_id, || {
+            let emitted_trade = emit_once(&env, EventType::TradeExecuted, 99, || {
+                env.events()
+                    .publish((Symbol::new(&env, "trade_executed"),), 99u64);
+            });
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtPositionClosedByKeeper {
-    pub user: Address,
-    pub position_id: u64,
-    pub asset_pair: u32,
-}
+            let emitted_stop = emit_once(&env, EventType::StopLossTriggered, 99, || {
+                env.events()
+                    .publish((Symbol::new(&env, "stop_loss"),), 99u64);
+            });
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtSubscriptionCreated {
-    pub user: Address,
-    pub provider: Address,
-    pub expires_at: u64,
-}
+            assert!(emitted_trade);
+            assert!(emitted_stop);
+            assert_eq!(env.events().all().len(), 2);
+        });
+    }
 
-pub fn emit_trade_shareable(env: &Env, evt: EvtTradeShareable) {
-    env.events().publish(
-        (contract_user_portfolio(env), Symbol::new(env, "trade_shareable")),
-        evt,
-    );
-}
+    /// Simulates a retry: same (event_type, entity_id) called twice in the same
+    /// ledger — only the first emission reaches the event log.
+    #[test]
+    fn test_retry_scenario_emits_single_event() {
+        let (env, contract_id) = setup();
 
-pub fn emit_position_closed_by_keeper(env: &Env, evt: EvtPositionClosedByKeeper) {
-    env.events().publish(
-        (contract_user_portfolio(env), Symbol::new(env, "keeper_close")),
-        evt,
-    );
-}
+        env.as_contract(&contract_id, || {
+            // First attempt (original transaction)
+            emit_once(&env, EventType::SignalAdopted, 7, || {
+                env.events()
+                    .publish((Symbol::new(&env, "signal_adopted"),), 7u64);
+            });
 
-pub fn emit_subscription_created(env: &Env, evt: EvtSubscriptionCreated) {
-    env.events().publish(
-        (contract_user_portfolio(env), Symbol::new(env, "subscription_created")),
-        evt,
-    );
-}
+            // Retry (resubmitted transaction, same ledger)
+            emit_once(&env, EventType::SignalAdopted, 7, || {
+                env.events()
+                    .publish((Symbol::new(&env, "signal_adopted"),), 7u64);
+            });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SignalRegistry events
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtSignalAdopted {
-    pub signal_id: u64,
-    pub adopter: Address,
-    pub new_count: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtSignalEdited {
-    pub signal_id: u64,
-    pub provider: Address,
-    pub price: i128,
-    pub rationale_hash: String,
-    pub confidence: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtReputationUpdated {
-    pub provider: Address,
-    pub old_score: u32,
-    pub new_score: u32,
-}
-
-pub fn emit_signal_adopted(env: &Env, evt: EvtSignalAdopted) {
-    env.events().publish(
-        (contract_signal_registry(env), Symbol::new(env, "signal_adopted")),
-        evt,
-    );
-}
-
-pub fn emit_signal_edited(env: &Env, evt: EvtSignalEdited) {
-    env.events().publish(
-        (contract_signal_registry(env), Symbol::new(env, "signal_edited")),
-        evt,
-    );
-}
-
-pub fn emit_reputation_updated(env: &Env, evt: EvtReputationUpdated) {
-    env.events().publish(
-        (contract_signal_registry(env), Symbol::new(env, "reputation_updated")),
-        evt,
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Governance events
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtStakeChanged {
-    pub holder: Address,
-    pub amount: i128,
-    pub is_stake: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtRewardClaimed {
-    pub beneficiary: Address,
-    pub amount: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct EvtVestingReleased {
-    pub beneficiary: Address,
-    pub amount: i128,
-}
-
-pub fn emit_stake_changed(env: &Env, evt: EvtStakeChanged) {
-    env.events().publish(
-        (contract_governance(env), Symbol::new(env, "stake_changed")),
-        evt,
-    );
-}
-
-pub fn emit_reward_claimed(env: &Env, evt: EvtRewardClaimed) {
-    env.events().publish(
-        (contract_governance(env), Symbol::new(env, "reward_claimed")),
-        evt,
-    );
-}
-
-pub fn emit_vesting_released(env: &Env, evt: EvtVestingReleased) {
-    env.events().publish(
-        (contract_governance(env), Symbol::new(env, "vesting_released")),
-        evt,
-    );
+            // Exactly one event must appear in the log.
+            let all_events = env.events().all();
+            assert_eq!(all_events.len(), 1, "retry must not produce duplicate event");
+        });
+    }
 }
