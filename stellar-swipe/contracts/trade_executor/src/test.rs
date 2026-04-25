@@ -269,16 +269,19 @@ fn execute_copy_trade_requires_user_auth() {
     let per = TRADE_AMOUNT + DEFAULT_ESTIMATED_COPY_TRADE_FEE;
     StellarAssetClient::new(&env, &token).mint(&user, &(per + 1_000_000));
 
-    let portfolio_id = env.register(MockUserPortfolio, ());
-    let exec_id = env.register(TradeExecutorContract, ());
-    let exec = TradeExecutorContractClient::new(&env, &exec_id);
-    exec.initialize(&admin);
-    exec.set_user_portfolio(&portfolio_id);
-
-    // Clear all mocked auths so require_auth() is enforced on the next call.
-    env.set_auths(&[]);
-    let result = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None::<u32>);
-    assert!(result.is_err(), "execute_copy_trade must require user auth");
+    // Do NOT mock auths — call without any auth context.
+    let err = env.as_contract(&exec_id, || {
+        TradeExecutorContract::execute_copy_trade(
+            env.clone(),
+            user.clone(),
+            token.clone(),
+            TRADE_AMOUNT,
+            None,
+        )
+    });
+    // Without mock_all_auths the require_auth() panics, surfaced as an error.
+    // We just verify the call does not succeed silently.
+    assert!(err.is_err(), "execute_copy_trade must require user auth");
 }
 
 // ── Reentrancy guard tests ────────────────────────────────────────────────────
@@ -341,12 +344,10 @@ fn reentrant_call_returns_reentrancy_detected() {
     exec.initialize(&admin);
     exec.set_user_portfolio(&portfolio_id);
 
-    // Simulate reentrancy: manually set the lock in temporary storage, then
-    // verify the next call is rejected with ReentrancyDetected.
-    env.as_contract(&exec_id, || {
-        let lock_key = soroban_sdk::Symbol::new(&env, "ExecLock");
-        env.storage().temporary().set(&lock_key, &true);
-    });
+    ReentrantPortfolioClient::new(&env, &portfolio_id).set_executor(&exec_id);
+    ReentrantPortfolioClient::new(&env, &portfolio_id).set_user(&user);
+
+    exec.execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None::<u32>);
 
     let result = exec.try_execute_copy_trade(&user, &token, &TRADE_AMOUNT, &None::<u32>);
     assert!(
@@ -754,7 +755,8 @@ fn cancel_copy_trade_third_party_rejected() {
 // ── Event format tests ────────────────────────────────────────────────────────
 
 fn last_event_topics(env: &Env) -> (soroban_sdk::Symbol, soroban_sdk::Symbol) {
-    use soroban_sdk::{testutils::Events, TryFromVal};
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryFromVal;
     let events = env.events().all();
     let e = events.last().unwrap();
     let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;

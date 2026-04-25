@@ -5,6 +5,9 @@
 mod queries;
 mod storage;
 mod subscriptions;
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod portfolio_tests;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 use storage::DataKey;
@@ -184,6 +187,7 @@ impl UserPortfolio {
             shared::events::emit_trade_shareable(
                 env,
                 shared::events::EvtTradeShareable {
+                    schema_version: shared::events::SCHEMA_VERSION,
                     user: user.clone(),
                     position_id,
                     asset_pair,
@@ -275,6 +279,7 @@ impl UserPortfolio {
         shared::events::emit_position_closed_by_keeper(
             env,
             shared::events::EvtPositionClosedByKeeper {
+                schema_version: shared::events::SCHEMA_VERSION,
                 user: user.clone(),
                 position_id,
                 asset_pair,
