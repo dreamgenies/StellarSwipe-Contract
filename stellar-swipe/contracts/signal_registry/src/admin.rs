@@ -10,7 +10,8 @@ use crate::events::*;
 // Constants
 pub const MAX_FEE_BPS: u32 = 100; // 1% max fee
 pub const MAX_RISK_PERCENTAGE: u32 = 100; // 100% max
-const ADMIN_TRANSFER_EXPIRY_LEDGERS: u32 = 34_560; // ~48h at ~5s per ledger close
+/// Wall-clock admin transfer validity (matches admin transfer tests).
+const ADMIN_TRANSFER_EXPIRY_SECS: u64 = 48 * 60 * 60;
 
 // Default values
 pub const DEFAULT_MIN_STAKE: i128 = 100_000_000; // 100 XLM (7 decimals)
@@ -35,6 +36,16 @@ pub enum AdminStorageKey {
     MultiSigSigners,
     MultiSigThreshold,
     FeeCollectionPaused,
+    PendingAdmin,
+    PendingAdminExpiry,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub pending_admin: Address,
+    /// Unix timestamp (seconds) after which the proposal cannot be accepted.
+    pub expires_at: u64,
 }
 
 #[contracttype]
@@ -173,12 +184,12 @@ fn get_pending_admin_transfer(env: &Env) -> Option<PendingAdminTransfer> {
 }
 
 fn require_active_pending_admin_transfer(env: &Env) -> Result<PendingAdminTransfer, AdminError> {
-    let pending = get_pending_admin_transfer(env).ok_or(AdminError::NoPendingAdminTransfer)?;
+    let pending = get_pending_admin_transfer(env).ok_or(AdminError::PendingAdminNotFound)?;
     if env.ledger().sequence() > pending.expires_at_ledger {
         env.storage()
             .instance()
             .remove(&AdminStorageKey::PendingAdminTransfer);
-        return Err(AdminError::AdminTransferExpired);
+        return Err(AdminError::PendingAdminExpired);
     }
     Ok(pending)
 }
@@ -191,20 +202,20 @@ pub fn propose_admin_transfer(
     require_admin(env, caller)?;
     caller.require_auth();
 
-    let expires_at_ledger = env
+    let expires_at = env
         .ledger()
-        .sequence()
-        .saturating_add(ADMIN_TRANSFER_EXPIRY_LEDGERS);
+        .timestamp()
+        .saturating_add(ADMIN_TRANSFER_EXPIRY_SECS);
     let pending = PendingAdminTransfer {
         pending_admin: new_admin.clone(),
-        expires_at_ledger,
+        expires_at,
     };
 
     env.storage()
         .instance()
         .set(&AdminStorageKey::PendingAdminTransfer, &pending);
 
-    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger);
+    emit_admin_transfer_proposed(env, caller.clone(), new_admin, expires_at_ledger as u64);
     Ok(())
 }
 
