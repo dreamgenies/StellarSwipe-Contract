@@ -23,6 +23,18 @@ pub enum AdminError {
     ScheduleNotFound = 19,
     NotScheduleOwner = 20,
     CircuitBreakerTriggered = 21,
+    PendingAdminNotFound = 22,
+    PendingAdminExpired = 23,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AiScoreError {
+    Unauthorized = 600,
+    OracleNotConfigured = 601,
+    InvalidScore = 602,
+    SignalNotFound = 603,
 }
 
 #[contracterror]
@@ -187,4 +199,3 @@ pub enum SignalOutcomeError {
     SignalNotClosed = 1152,
     OutcomeAlreadyRecorded = 1153,
 }
-

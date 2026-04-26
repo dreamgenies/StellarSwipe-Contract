@@ -1,13 +1,13 @@
 //! Read-side P&L aggregation: realized from closed positions, unrealized via oracle price.
 
 use crate::storage::DataKey;
-use crate::{PnlSummary, Position, PositionStatus, TradeHistoryEntry};
-use soroban_sdk::{symbol_short, Address, Env, Val, Vec};
+use crate::{PnlSummary, Position, PositionStatus};
+use soroban_sdk::{Address, Env, Vec};
+use stellar_swipe_common::{
+    oracle_price_to_i128, validate_freshness, IOracleClient, OnChainOracleClient,
+};
 
-const GET_PRICE: soroban_sdk::Symbol = symbol_short!("get_price");
-const MAX_TRADE_HISTORY_LIMIT: u32 = 50;
-
-/// Sum closed `realized_pnl`, optionally sum open unrealized using oracle `get_price() -> i128`.
+/// Sum closed `realized_pnl`, optionally sum open unrealized using oracle `get_price(asset_pair) -> OraclePrice`.
 /// If the oracle call fails, returns realized-only totals with `unrealized_pnl: None`.
 pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
     let oracle: Address = env
@@ -15,6 +15,11 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
         .instance()
         .get(&DataKey::Oracle)
         .expect("oracle not configured");
+    let asset_pair: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::OracleAssetPair)
+        .unwrap_or(0);
 
     let ids: Vec<u64> = env
         .storage()
@@ -53,13 +58,14 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
         }
     }
 
-    let empty_args: Vec<Val> = Vec::new(env);
-    let current_price: Option<i128> = match env
-        .try_invoke_contract::<i128, soroban_sdk::Error>(&oracle, &GET_PRICE, empty_args)
-    {
-        Ok(Ok(p)) => Some(p),
-        Ok(Err(_)) | Err(_) => None,
-    };
+    let current_price = OnChainOracleClient { address: oracle }
+        .get_price(env, asset_pair)
+        .ok()
+        .and_then(|price| {
+            validate_freshness(env, &price)
+                .ok()
+                .map(|_| oracle_price_to_i128(&price))
+        });
 
     let unrealized_pnl: Option<i128> = if !has_open {
         Some(0_i128)
@@ -199,7 +205,10 @@ fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
         Some(n) => n,
         None => return 0,
     };
-    let q = num / total_invested;
+    let q = match num.checked_div(total_invested) {
+        Some(v) => v,
+        None => return 0,
+    };
     if q > i32::MAX as i128 {
         i32::MAX
     } else if q < i32::MIN as i128 {
