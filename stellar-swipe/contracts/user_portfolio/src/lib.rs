@@ -43,6 +43,13 @@ pub struct Position {
     pub realized_pnl: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeHistoryEntry {
+    pub trade_id: u64,
+    pub position: Position,
+}
+
 #[contract]
 pub struct UserPortfolio;
 

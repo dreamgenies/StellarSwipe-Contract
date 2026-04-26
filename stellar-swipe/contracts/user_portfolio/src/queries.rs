@@ -118,6 +118,85 @@ pub fn compute_get_pnl(env: &Env, user: Address) -> PnlSummary {
     }
 }
 
+pub fn get_trade_history(
+    env: &Env,
+    user: Address,
+    cursor: Option<u64>,
+    limit: u32,
+) -> Vec<TradeHistoryEntry> {
+    let page_limit = limit.min(MAX_TRADE_HISTORY_LIMIT);
+    let mut page = Vec::new(env);
+    if page_limit == 0 {
+        return page;
+    }
+
+    let closed_ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserClosedPositions(user.clone()))
+        .unwrap_or_else(|| rebuild_closed_position_index(env, user));
+
+    let mut next_index = closed_ids.len();
+    if let Some(cursor_id) = cursor {
+        for i in 0..closed_ids.len() {
+            if closed_ids.get(i) == Some(cursor_id) {
+                next_index = i;
+                break;
+            }
+        }
+    }
+
+    while next_index > 0 && page.len() < page_limit {
+        next_index -= 1;
+        let Some(trade_id) = closed_ids.get(next_index) else {
+            continue;
+        };
+        let Some(position) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Position>(&DataKey::Position(trade_id))
+        else {
+            continue;
+        };
+        if position.status != PositionStatus::Closed {
+            continue;
+        }
+        page.push_back(TradeHistoryEntry { trade_id, position });
+    }
+
+    page
+}
+
+fn rebuild_closed_position_index(env: &Env, user: Address) -> Vec<u64> {
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserPositions(user.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut closed_ids = Vec::new(env);
+
+    for i in 0..ids.len() {
+        let Some(id) = ids.get(i) else {
+            continue;
+        };
+        let Some(position) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Position>(&DataKey::Position(id))
+        else {
+            continue;
+        };
+        if position.status == PositionStatus::Closed {
+            closed_ids.push_back(id);
+        }
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserClosedPositions(user), &closed_ids);
+    closed_ids
+}
+
 fn roi_basis_points(total_pnl: i128, total_invested: i128) -> i32 {
     if total_invested == 0 {
         return 0;
